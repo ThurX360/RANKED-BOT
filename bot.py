@@ -3,10 +3,11 @@ import os
 import json
 import random
 import datetime as dt
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import discord
 from discord import app_commands
+from discord.abc import Messageable
 from discord.ext import commands
 
 # =========================
@@ -23,6 +24,18 @@ MVP_BONUS = 25  # não dobra
 # Itens
 ITEM_DOUBLE = "double"   # ✖2
 ITEM_SHIELD = "shield"   # 🛡️
+
+ITEM_ALIASES = {
+    ITEM_DOUBLE: ITEM_DOUBLE,
+    ITEM_SHIELD: ITEM_SHIELD,
+    "dobro": ITEM_DOUBLE,
+    "double": ITEM_DOUBLE,
+    "x2": ITEM_DOUBLE,
+    "✖2": ITEM_DOUBLE,
+    "escudo": ITEM_SHIELD,
+    "shield": ITEM_SHIELD,
+    "🛡️": ITEM_SHIELD,
+}
 
 # Medalhas por streak
 STREAK_MEDALS = {3: "🔥 3-streak", 5: "⚡ 5-streak", 10: "🏆 10-streak"}
@@ -58,6 +71,29 @@ def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+PLAYER_TEMPLATE = {
+    "points": 0,
+    "wins": 0,
+    "losses": 0,
+    "mvps": 0,
+    "streak": 0,
+    "max_streak": 0,
+    "medals": [],
+    "items": {ITEM_DOUBLE: 1, ITEM_SHIELD: 1},
+    "history": [],
+    "coins": 0,
+    "last_daily": None,
+}
+
+
+def _deepcopy_player_template() -> dict:
+    data = PLAYER_TEMPLATE.copy()
+    data["items"] = PLAYER_TEMPLATE["items"].copy()
+    data["medals"] = PLAYER_TEMPLATE["medals"].copy()
+    data["history"] = PLAYER_TEMPLATE["history"].copy()
+    return data
+
+
 players: Dict[str, dict] = load_json(PLAYERS_FILE, {})
 matches: List[dict] = load_json(MATCHES_FILE, [])
 config  = load_json(CONFIG_FILE, {
@@ -70,21 +106,32 @@ config  = load_json(CONFIG_FILE, {
     }
 })
 
-def ensure_player(pid: str):
-    if pid not in players:
-        players[pid] = {
-            "points": 0,
-            "wins": 0,
-            "losses": 0,
-            "mvps": 0,
-            "streak": 0,
-            "max_streak": 0,
-            "medals": [],
-            "items": {ITEM_DOUBLE: 1, ITEM_SHIELD: 1},
-            "history": [],
-            "coins": 0,
-            "last_daily": None
-        }
+
+def ensure_player(pid: str) -> dict:
+    player = players.get(pid)
+    if not player:
+        player = _deepcopy_player_template()
+        players[pid] = player
+        return player
+
+    # Atualiza estruturas com campos que possam ter sido adicionados em versões novas
+    for key, value in PLAYER_TEMPLATE.items():
+        if key not in player:
+            if isinstance(value, (list, dict)):
+                player[key] = value.copy()
+            else:
+                player[key] = value
+
+    # Garante chaves dos itens (para bases antigas sem o item novo)
+    items = player.setdefault("items", {})
+    for item_key, default_amount in PLAYER_TEMPLATE["items"].items():
+        items.setdefault(item_key, default_amount)
+
+    player.setdefault("medals", [])
+    player.setdefault("history", [])
+    player.setdefault("coins", 0)
+
+    return player
 
 # =========================
 #           BOT
@@ -158,19 +205,199 @@ def valid_team_size(n: Optional[int]) -> int:
         n = 4
     return 2 if n == 2 else (3 if n == 3 else 4)
 
+
+ResponseTarget = Union[commands.Context, discord.Interaction]
+
+
+async def send_response(target: ResponseTarget, *args, **kwargs):
+    if isinstance(target, commands.Context):
+        return await target.send(*args, **kwargs)
+
+    interaction: discord.Interaction = target
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, **kwargs)
+    return await interaction.response.send_message(*args, **kwargs)
+
+
+def build_profile_embed(member: discord.Member, pdata: dict) -> discord.Embed:
+    tname, temoji = tier_of(pdata["points"])
+    embed = discord.Embed(
+        title=f"📊 Perfil de {member.display_name}",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(name="Pontos / Tier", value=f"**{pdata['points']}** {temoji} `{tname}`", inline=True)
+    embed.add_field(name="Vitórias / Derrotas", value=f"**{pdata['wins']}** / **{pdata['losses']}**", inline=True)
+    embed.add_field(name="MVPs", value=str(pdata["mvps"]), inline=True)
+    embed.add_field(
+        name="Streak (máx.)",
+        value=f"{pdata['streak']} (**máx:** {pdata['max_streak']})",
+        inline=True,
+    )
+    embed.add_field(name="Moedas", value=str(pdata.get("coins", 0)), inline=True)
+    medals = ", ".join(pdata.get("medals", [])) or "—"
+    embed.add_field(name="Medalhas", value=medals, inline=False)
+    return embed
+
+
+def build_inventory_embed(member: discord.Member, pdata: dict) -> discord.Embed:
+    inv = pdata.get("items", {})
+    embed = discord.Embed(
+        title=f"🧰 Inventário de {member.display_name}",
+        color=discord.Color.teal(),
+    )
+    embed.add_field(name="✖2 Dobro", value=str(inv.get(ITEM_DOUBLE, 0)), inline=True)
+    embed.add_field(name="🛡️ Escudo", value=str(inv.get(ITEM_SHIELD, 0)), inline=True)
+    return embed
+
+
+def build_top_embed(title: str, lines: List[str], color: discord.Color) -> discord.Embed:
+    description = "\n".join(lines) if lines else "—"
+    return discord.Embed(title=title, description=description, color=color)
+
+
+def build_history_embed(member: discord.Member, history_ids: List[str], limit: int = 5) -> Optional[discord.Embed]:
+    if not history_ids:
+        return None
+
+    embed = discord.Embed(
+        title=f"🗂️ Últimas partidas de {member.display_name}",
+        color=discord.Color.purple(),
+    )
+    for mid in reversed(history_ids[-limit:]):
+        match = next((x for x in matches if x["id"] == mid), None)
+        if not match:
+            continue
+        when = match.get("time", "")[:19].replace("T", " ")
+        winner = "AZUL" if match.get("winner") == "blue" else "VERMELHO"
+        delta_me = match.get("points_delta", {}).get(str(member.id), 0)
+        size = match.get("team_size", 4)
+        mvp = match.get("mvp")
+        mvp_text = f"<@{mvp}>" if mvp else "—"
+        embed.add_field(
+            name=f"{mid} • {when} • {size}v{size}",
+            value=f"Vencedor: **{winner}** | MVP: {mvp_text} | Seu delta: **{delta_me}**",
+            inline=False,
+        )
+    return embed
+
+
+def build_store_embed() -> discord.Embed:
+    linhas = []
+    for key, preco in ITEM_PRICE.items():
+        nome = "🛡️ Escudo" if key == ITEM_SHIELD else "✖2 Dobro"
+        linhas.append(f"• **{nome}** (`{key}`) — **{preco}** coins (comprar/vender)")
+    return discord.Embed(title="🛒 Loja", description="\n".join(linhas), color=discord.Color.blurple())
+
+
+def normalize_item_key(item: str) -> Optional[str]:
+    if not item:
+        return None
+    item_lower = item.lower()
+    resolved = ITEM_ALIASES.get(item_lower)
+    if resolved:
+        return resolved
+    return item_lower if item_lower in ITEM_PRICE else None
+
+
+async def handle_purchase(target: ResponseTarget, author: discord.Member, item: str, quantity: int):
+    item_key = normalize_item_key(item)
+    if not item_key:
+        return await send_response(target, "❌ Item inválido. Use `!loja` para ver os itens.")
+    if quantity < 1 or quantity > 50:
+        return await send_response(target, "⚠️ Quantidade inválida (1–50).")
+
+    pdata = ensure_player(str(author.id))
+    cost = ITEM_PRICE[item_key] * quantity
+    if pdata.get("coins", 0) < cost:
+        return await send_response(target, f"💸 Coins insuficientes. Precisa de **{cost}**.")
+
+    pdata["coins"] -= cost
+    inventory = pdata["items"]
+    inventory[item_key] = inventory.get(item_key, 0) + quantity
+    save_json(PLAYERS_FILE, players)
+
+    nome = "🛡️ Escudo" if item_key == ITEM_SHIELD else "✖2 Dobro"
+    return await send_response(target, f"✅ Comprou **{quantity}x {nome}** por **{cost}** coins.")
+
+
+async def handle_sale(target: ResponseTarget, author: discord.Member, item: str, quantity: int):
+    item_key = normalize_item_key(item)
+    if not item_key:
+        return await send_response(target, "❌ Item inválido. Use `!loja` para ver os itens.")
+    if quantity < 1 or quantity > 50:
+        return await send_response(target, "⚠️ Quantidade inválida (1–50).")
+
+    pdata = ensure_player(str(author.id))
+    inventory = pdata["items"]
+    if inventory.get(item_key, 0) < quantity:
+        return await send_response(target, "⚠️ Você não tem itens suficientes pra vender.")
+
+    ganho = ITEM_PRICE[item_key] * quantity
+    inventory[item_key] -= quantity
+    pdata["coins"] = pdata.get("coins", 0) + ganho
+    save_json(PLAYERS_FILE, players)
+
+    nome = "🛡️ Escudo" if item_key == ITEM_SHIELD else "✖2 Dobro"
+    return await send_response(target, f"💱 Vendeu **{quantity}x {nome}** e recebeu **{ganho}** coins.")
+
+
+async def handle_gift(target: ResponseTarget, sender: discord.Member, receiver: discord.Member, amount: int):
+    if receiver.id == sender.id:
+        return await send_response(target, "❌ Você não pode presentear a si mesmo.")
+    if amount <= 0:
+        return await send_response(target, "⚠️ Informe uma quantidade positiva.")
+
+    remetente = ensure_player(str(sender.id))
+    destinatario = ensure_player(str(receiver.id))
+    if remetente.get("coins", 0) < amount:
+        return await send_response(target, "💸 Coins insuficientes para presentear.")
+
+    remetente["coins"] -= amount
+    destinatario["coins"] = destinatario.get("coins", 0) + amount
+    save_json(PLAYERS_FILE, players)
+
+    return await send_response(
+        target,
+        f"🎁 **{sender.display_name}** presenteou **{receiver.display_name}** com **{amount}** coins!",
+    )
+
+
+async def handle_daily(target: ResponseTarget, member: discord.Member):
+    pid = str(member.id)
+    pdata = ensure_player(pid)
+    ok, hrs = can_daily(pdata.get("last_daily"))
+    if not ok:
+        return await send_response(target, f"⏳ Você já pegou seu daily. Tente novamente em ~**{hrs}h**.")
+
+    reward = random.choice(DAILY_REWARDS)
+    if reward[0] == "coins":
+        amount = int(reward[1])
+        pdata["coins"] = pdata.get("coins", 0) + amount
+        text = f"🎁 Você recebeu **{amount}** coin(s) no daily!"
+    else:
+        item = reward[1]
+        pdata["items"][item] = pdata["items"].get(item, 0) + 1
+        pretty = "🛡️ Escudo" if item == ITEM_SHIELD else "✖2 Dobro"
+        text = f"🎁 Você recebeu **1x {pretty}** no daily!"
+
+    pdata["last_daily"] = dt.datetime.utcnow().isoformat()
+    save_json(PLAYERS_FILE, players)
+
+    return await send_response(target, text)
+
 # =========================
 #   RANKING / APELIDOS
 # =========================
-async def refresh_leaderboard_and_nicks(ctx: commands.Context):
+async def refresh_leaderboard_and_nicks(guild: discord.Guild, fallback_channel: Messageable):
     ranking = sorted(players.items(), key=lambda kv: kv[1]["points"], reverse=True)
 
     # atualiza apelidos conforme ranking
     for i, (pid, pdata) in enumerate(ranking, start=1):
-        member = ctx.guild.get_member(int(pid))
+        member = guild.get_member(int(pid))
         if not member:
             continue
         try:
-            await member.edit(nick=rank_emoji_name(ctx.guild, member, i))
+            await member.edit(nick=rank_emoji_name(guild, member, i))
         except Exception:
             pass
 
@@ -182,13 +409,13 @@ async def refresh_leaderboard_and_nicks(ctx: commands.Context):
     )
     desc = []
     for i, (pid, pdata) in enumerate(ranking[:10], start=1):
-        m = ctx.guild.get_member(int(pid))
+        m = guild.get_member(int(pid))
         name = m.display_name if m else f"Jogador {pid}"
         tname, temoji = tier_of(pdata["points"])
         desc.append(f"**{i}. {name}** — {pdata['points']} pts {temoji} `{tname}`")
     embed.description = "\n".join(desc) if desc else "Sem jogadores ainda."
 
-    target = ch_obj(ctx.guild, "ranking") or ctx.channel
+    target = ch_obj(guild, "ranking") or fallback_channel
     await target.send(embed=embed)
 
 # =========================
@@ -630,7 +857,7 @@ class MatchPanelView(discord.ui.View):
         # encerra
         active_matches.pop(self.ctx.channel.id, None)
         self.stop()
-        await refresh_leaderboard_and_nicks(self.ctx)
+        await refresh_leaderboard_and_nicks(self.ctx.guild, self.ctx.channel)
 
 # =========================
 #          EVENTOS
@@ -701,37 +928,163 @@ async def slash_fila(interaction: discord.Interaction, tamanho: Optional[app_com
 
     await send_in(guild, "notificacoes", content=f"🔔 **Fila criada! ({size}v{size})** Clique em **Entrar** para participar. 🕹️")         or await channel.send(f"🔔 **Fila criada! ({size}v{size})** Clique em **Entrar** para participar. 🕹️")
 
+@bot.tree.command(name="perfil", description="Mostra o perfil do jogador (pontos, vitórias, medalhas e moedas).")
+@app_commands.describe(usuario="Jogador para consultar", ocultar="Se marcado, resposta apenas para você.")
+async def slash_perfil(
+    interaction: discord.Interaction,
+    usuario: Optional[discord.Member] = None,
+    ocultar: Optional[bool] = False,
+):
+    member = usuario or interaction.user
+    pdata = ensure_player(str(member.id))
+    await send_response(interaction, embed=build_profile_embed(member, pdata), ephemeral=bool(ocultar))
+
+
+@bot.tree.command(name="inventario", description="Mostra os itens disponíveis de um jogador.")
+@app_commands.describe(usuario="Jogador para consultar", ocultar="Se marcado, resposta apenas para você.")
+async def slash_inventario(
+    interaction: discord.Interaction,
+    usuario: Optional[discord.Member] = None,
+    ocultar: Optional[bool] = False,
+):
+    member = usuario or interaction.user
+    pdata = ensure_player(str(member.id))
+    await send_response(interaction, embed=build_inventory_embed(member, pdata), ephemeral=bool(ocultar))
+
+
+@bot.tree.command(name="top", description="Atualiza e exibe o top 10 de pontos.")
+async def slash_top(interaction: discord.Interaction):
+    guild = interaction.guild
+    channel = interaction.channel
+    if not guild or not channel:
+        return await interaction.response.send_message("❌ Use este comando dentro de um servidor.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    await refresh_leaderboard_and_nicks(guild, channel)
+    await interaction.followup.send("🏆 Ranking atualizado!", ephemeral=True)
+
+
+@bot.tree.command(name="topvitorias", description="Top 10 jogadores com mais vitórias.")
+async def slash_top_vitorias(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        return await interaction.response.send_message("❌ Disponível apenas em servidores.", ephemeral=True)
+    ranking = sorted(players.items(), key=lambda kv: kv[1].get("wins", 0), reverse=True)[:10]
+    lines = []
+    for i, (pid, pdata) in enumerate(ranking, start=1):
+        member = guild.get_member(int(pid))
+        name = member.display_name if member else f"Jogador {pid}"
+        lines.append(f"**{i}.** {name} — **{pdata.get('wins', 0)}** vitórias")
+    await send_response(interaction, embed=build_top_embed("🏆 Top Vitórias", lines, discord.Color.gold()))
+
+
+@bot.tree.command(name="topderrotas", description="Top 10 jogadores com mais derrotas.")
+async def slash_top_derrotas(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        return await interaction.response.send_message("❌ Disponível apenas em servidores.", ephemeral=True)
+    ranking = sorted(players.items(), key=lambda kv: kv[1].get("losses", 0), reverse=True)[:10]
+    lines = []
+    for i, (pid, pdata) in enumerate(ranking, start=1):
+        member = guild.get_member(int(pid))
+        name = member.display_name if member else f"Jogador {pid}"
+        lines.append(f"**{i}.** {name} — **{pdata.get('losses', 0)}** derrotas")
+    await send_response(interaction, embed=build_top_embed("💀 Top Derrotas", lines, discord.Color.red()))
+
+
+@bot.tree.command(name="topstreak", description="Top 10 com maior sequência de vitórias.")
+async def slash_top_streak(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        return await interaction.response.send_message("❌ Disponível apenas em servidores.", ephemeral=True)
+    ranking = sorted(players.items(), key=lambda kv: kv[1].get("max_streak", 0), reverse=True)[:10]
+    lines = []
+    for i, (pid, pdata) in enumerate(ranking, start=1):
+        member = guild.get_member(int(pid))
+        name = member.display_name if member else f"Jogador {pid}"
+        lines.append(f"**{i}.** {name} — **{pdata.get('max_streak',0)}** (máx)")
+    await send_response(interaction, embed=build_top_embed("🔥 Top Streak Máxima", lines, discord.Color.orange()))
+
+
+@bot.tree.command(name="historico", description="Mostra as últimas partidas de um jogador.")
+@app_commands.describe(usuario="Jogador para consultar", quantidade="Quantidade de partidas (1-10)", ocultar="Se marcado, resposta apenas para você.")
+async def slash_historico(
+    interaction: discord.Interaction,
+    usuario: Optional[discord.Member] = None,
+    quantidade: Optional[int] = 5,
+    ocultar: Optional[bool] = False,
+):
+    member = usuario or interaction.user
+    pdata = ensure_player(str(member.id))
+    limit = max(1, min(int(quantidade or 5), 10))
+    embed = build_history_embed(member, pdata["history"], limit=limit)
+    if not embed:
+        return await send_response(interaction, "📭 Sem histórico ainda.", ephemeral=bool(ocultar))
+    await send_response(interaction, embed=embed, ephemeral=bool(ocultar))
+
+
+@bot.tree.command(name="saldo", description="Mostra as moedas de um jogador.")
+@app_commands.describe(usuario="Jogador para consultar", ocultar="Se marcado, resposta apenas para você.")
+async def slash_saldo(
+    interaction: discord.Interaction,
+    usuario: Optional[discord.Member] = None,
+    ocultar: Optional[bool] = False,
+):
+    member = usuario or interaction.user
+    pdata = ensure_player(str(member.id))
+    coins = pdata.get("coins", 0)
+    await send_response(
+        interaction,
+        f"💰 **{member.display_name}** tem **{coins}** coins.",
+        ephemeral=bool(ocultar),
+    )
+
+
+@bot.tree.command(name="loja", description="Exibe os itens disponíveis para compra/venda.")
+async def slash_loja(interaction: discord.Interaction):
+    await send_response(interaction, embed=build_store_embed())
+
+
+@bot.tree.command(name="comprar", description="Compra itens na loja usando coins.")
+@app_commands.describe(item="double/dobro ou shield/escudo", quantidade="Quantidade (1-50)")
+async def slash_comprar(interaction: discord.Interaction, item: str, quantidade: Optional[int] = 1):
+    await handle_purchase(interaction, interaction.user, item, quantidade or 1)
+
+
+@bot.tree.command(name="vender", description="Vende itens em troca de coins.")
+@app_commands.describe(item="double/dobro ou shield/escudo", quantidade="Quantidade (1-50)")
+async def slash_vender(interaction: discord.Interaction, item: str, quantidade: Optional[int] = 1):
+    await handle_sale(interaction, interaction.user, item, quantidade or 1)
+
+
+@bot.tree.command(name="presentear", description="Transfere coins para outro jogador.")
+@app_commands.describe(jogador="Jogador que receberá os coins", quantidade="Quantidade positiva de coins")
+async def slash_presentear(interaction: discord.Interaction, jogador: discord.Member, quantidade: int):
+    await handle_gift(interaction, interaction.user, jogador, quantidade)
+
+
+@bot.tree.command(name="daily", description="Resgata a recompensa diária de coins ou itens.")
+async def slash_daily(interaction: discord.Interaction):
+    await handle_daily(interaction, interaction.user)
+
+
 @bot.command(name="perfil")
 async def cmd_perfil(ctx: commands.Context, member: Optional[discord.Member] = None):
     member = member or ctx.author
     pid = str(member.id)
-    ensure_player(pid)
-    p = players[pid]
-    tname, temoji = tier_of(p["points"])
-    embed = discord.Embed(title=f"📊 Perfil de {member.display_name}", color=discord.Color.blue())
-    embed.add_field(name="Pontos / Tier", value=f"**{p['points']}** {temoji} `{tname}`", inline=True)
-    embed.add_field(name="Vitórias / Derrotas", value=f"**{p['wins']}** / **{p['losses']}**", inline=True)
-    embed.add_field(name="MVPs", value=str(p["mvps"]), inline=True)
-    embed.add_field(name="Streak (máx.)", value=f"{p['streak']} (**máx:** {p['max_streak']})", inline=True)
-    embed.add_field(name="Moedas", value=str(p.get("coins", 0)), inline=True)
-    medals = ", ".join(p["medals"]) if p["medals"] else "—"
-    embed.add_field(name="Medalhas", value=medals, inline=False)
-    await ctx.send(embed=embed)
+    pdata = ensure_player(pid)
+    await ctx.send(embed=build_profile_embed(member, pdata))
 
 @bot.command(name="inventario", aliases=["inv"])
 async def cmd_inventory(ctx: commands.Context, member: Optional[discord.Member] = None):
     member = member or ctx.author
     pid = str(member.id)
-    ensure_player(pid)
-    inv = players[pid]["items"]
-    embed = discord.Embed(title=f"🧰 Inventário de {member.display_name}", color=discord.Color.teal())
-    embed.add_field(name="✖2 Dobro", value=str(inv.get(ITEM_DOUBLE, 0)), inline=True)
-    embed.add_field(name="🛡️ Escudo", value=str(inv.get(ITEM_SHIELD, 0)), inline=True)
-    await ctx.send(embed=embed)
+    pdata = ensure_player(pid)
+    await ctx.send(embed=build_inventory_embed(member, pdata))
 
 @bot.command(name="top")
 async def cmd_top(ctx: commands.Context):
-    await refresh_leaderboard_and_nicks(ctx)
+    await refresh_leaderboard_and_nicks(ctx.guild, ctx.channel)
 
 # ---- TOPs por estatística ----
 def _format_top_list(pairs, guild, key_label):
@@ -745,14 +1098,22 @@ def _format_top_list(pairs, guild, key_label):
 @bot.command(name="topvitorias")
 async def cmd_top_vitorias(ctx: commands.Context):
     ranking = sorted(players.items(), key=lambda kv: kv[1].get("wins", 0), reverse=True)[:10]
-    desc = _format_top_list(ranking, ctx.guild, "wins")
-    await ctx.send(embed=discord.Embed(title="🏆 Top Vitórias", description=desc, color=discord.Color.gold()))
+    lines = []
+    for i, (pid, pdata) in enumerate(ranking, start=1):
+        member = ctx.guild.get_member(int(pid))
+        name = member.display_name if member else f"Jogador {pid}"
+        lines.append(f"**{i}.** {name} — **{pdata.get('wins', 0)}** vitórias")
+    await ctx.send(embed=build_top_embed("🏆 Top Vitórias", lines, discord.Color.gold()))
 
 @bot.command(name="topderrotas")
 async def cmd_top_derrotas(ctx: commands.Context):
     ranking = sorted(players.items(), key=lambda kv: kv[1].get("losses", 0), reverse=True)[:10]
-    desc = _format_top_list(ranking, ctx.guild, "losses")
-    await ctx.send(embed=discord.Embed(title="💀 Top Derrotas", description=desc, color=discord.Color.red()))
+    lines = []
+    for i, (pid, pdata) in enumerate(ranking, start=1):
+        member = ctx.guild.get_member(int(pid))
+        name = member.display_name if member else f"Jogador {pid}"
+        lines.append(f"**{i}.** {name} — **{pdata.get('losses', 0)}** derrotas")
+    await ctx.send(embed=build_top_embed("💀 Top Derrotas", lines, discord.Color.red()))
 
 @bot.command(name="topstreak")
 async def cmd_top_streak(ctx: commands.Context):
@@ -762,33 +1123,17 @@ async def cmd_top_streak(ctx: commands.Context):
         m = ctx.guild.get_member(int(pid))
         name = m.display_name if m else f"Jogador {pid}"
         lines.append(f"**{i}.** {name} — **{pdata.get('max_streak',0)}** (máx)")
-    desc = "\n".join(lines) if lines else "—"
-    await ctx.send(embed=discord.Embed(title="🔥 Top Streak Máxima", description=desc, color=discord.Color.orange()))
+    await ctx.send(embed=build_top_embed("🔥 Top Streak Máxima", lines, discord.Color.orange()))
 
 # ---- Histórico ----
 @bot.command(name="historico")
 async def cmd_history(ctx: commands.Context, member: Optional[discord.Member] = None):
     member = member or ctx.author
     pid = str(member.id)
-    ensure_player(pid)
-    hist_ids = players[pid]["history"][-5:]
-    if not hist_ids:
+    pdata = ensure_player(pid)
+    embed = build_history_embed(member, pdata["history"], limit=5)
+    if not embed:
         return await ctx.send("📭 Sem histórico ainda.")
-
-    embed = discord.Embed(title=f"🗂️ Últimas partidas de {member.display_name}", color=discord.Color.purple())
-    for mid in reversed(hist_ids):
-        m = next((x for x in matches if x["id"] == mid), None)
-        if not m:
-            continue
-        when = m.get("time", "")[:19].replace("T", " ")
-        winner = "AZUL" if m["winner"] == "blue" else "VERMELHO"
-        delta_me = m.get("points_delta", {}).get(str(member.id), 0)
-        size = m.get("team_size", 4)
-        embed.add_field(
-            name=f"{mid} • {when} • {size}v{size}",
-            value=f"Vencedor: **{winner}** | MVP: <@{m.get('mvp')}> | Seu delta: **{delta_me}**",
-            inline=False
-        )
     await ctx.send(embed=embed)
 
 # ---- Ajuda ----
@@ -808,7 +1153,9 @@ async def cmd_help(ctx: commands.Context):
             f"**{PREFIX}saldo** — suas coins\n"
             f"**{PREFIX}loja** — ver itens e preços\n"
             f"**{PREFIX}comprar [double|shield] [qtd]** — compra item\n"
-            f"**{PREFIX}vender [double|shield] [qtd]** — vende item\n\n"
+            f"**{PREFIX}vender [double|shield] [qtd]** — vende item\n"
+            f"**{PREFIX}presentear @user [coins]** — transfere coins para alguém\n\n"
+            "Slash commands equivalentes: /fila, /perfil, /inventario, /top, /topvitorias, /topderrotas, /topstreak, /historico, /saldo, /loja, /comprar, /vender, /presentear, /daily.\n\n"
             "Admin:\n"
             f"**{PREFIX}setcanal** fila/partida/ranking/notificacoes/logs #canal\n"
             f"**{PREFIX}canais** — mostra configuração de canais\n"
@@ -857,80 +1204,29 @@ async def cmd_saldo(ctx, member: Optional[discord.Member] = None):
 
 @bot.command(name="loja")
 async def cmd_loja(ctx):
-    linhas = []
-    for key, preco in ITEM_PRICE.items():
-        nome = "🛡️ Escudo" if key == ITEM_SHIELD else "✖2 Dobro"
-        linhas.append(f"• **{nome}** (`{key}`) — **{preco}** coins (comprar/vender)")
-    await ctx.send(embed=discord.Embed(title="🛒 Loja", description="\n".join(linhas)))
+    await ctx.send(embed=build_store_embed())
 
 @bot.command(name="comprar")
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def cmd_comprar(ctx, item: str, qtd: int = 1):
-    item = item.lower()
-    if item not in ITEM_PRICE:
-        return await ctx.send("❌ Item inválido. Use `!loja` para ver os itens.")
-    if qtd < 1 or qtd > 50:
-        return await ctx.send("⚠️ Quantidade inválida (1–50).")
-
-    pid = str(ctx.author.id)
-    ensure_player(pid)
-    custo = ITEM_PRICE[item] * qtd
-    if players[pid].get("coins", 0) < custo:
-        return await ctx.send(f"💸 Coins insuficientes. Precisa de **{custo}**.")
-
-    players[pid]["coins"] -= custo
-    inv = players[pid]["items"]
-    inv[item] = inv.get(item, 0) + qtd
-    save_json(PLAYERS_FILE, players)
-    nome = "🛡️ Escudo" if item == ITEM_SHIELD else "✖2 Dobro"
-    await ctx.send(f"✅ Comprou **{qtd}x {nome}** por **{custo}** coins.")
+    await handle_purchase(ctx, ctx.author, item, qtd)
 
 @bot.command(name="vender")
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def cmd_vender(ctx, item: str, qtd: int = 1):
-    item = item.lower()
-    if item not in ITEM_PRICE:
-        return await ctx.send("❌ Item inválido. Use `!loja` para ver os itens.")
-    if qtd < 1 or qtd > 50:
-        return await ctx.send("⚠️ Quantidade inválida (1–50).")
+    await handle_sale(ctx, ctx.author, item, qtd)
 
-    pid = str(ctx.author.id)
-    ensure_player(pid)
-    inv = players[pid]["items"]
-    if inv.get(item, 0) < qtd:
-        return await ctx.send("⚠️ Você não tem itens suficientes pra vender.")
-
-    ganho = ITEM_PRICE[item] * qtd
-    inv[item] -= qtd
-    players[pid]["coins"] = players[pid].get("coins", 0) + ganho
-    save_json(PLAYERS_FILE, players)
-    nome = "🛡️ Escudo" if item == ITEM_SHIELD else "✖2 Dobro"
-    await ctx.send(f"💱 Vendeu **{qtd}x {nome}** e recebeu **{ganho}** coins.")
+# ---- Presentear coins ----
+@bot.command(name="presentear", aliases=["gift", "doar"])
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def cmd_presentear(ctx: commands.Context, membro: discord.Member, quantidade: int):
+    await handle_gift(ctx, ctx.author, membro, quantidade)
 
 # ---- Daily ----
 @bot.command(name="daily")
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def cmd_daily(ctx):
-    pid = str(ctx.author.id)
-    ensure_player(pid)
-    ok, hrs = can_daily(players[pid].get("last_daily"))
-    if not ok:
-        return await ctx.send(f"⏳ Você já pegou seu daily. Tente novamente em ~**{hrs}h**.")
-
-    reward = random.choice(DAILY_REWARDS)
-    if reward[0] == "coins":
-        amount = int(reward[1])
-        players[pid]["coins"] = players[pid].get("coins", 0) + amount
-        text = f"🎁 Você recebeu **{amount}** coin(s) no daily!"
-    else:
-        item = reward[1]
-        players[pid]["items"][item] = players[pid]["items"].get(item, 0) + 1
-        pretty = "🛡️ Escudo" if item == ITEM_SHIELD else "✖2 Dobro"
-        text = f"🎁 Você recebeu **1x {pretty}** no daily!"
-
-    players[pid]["last_daily"] = dt.datetime.utcnow().isoformat()
-    save_json(PLAYERS_FILE, players)
-    await ctx.send(text)
+    await handle_daily(ctx, ctx.author)
 
 # =========================
 #          RUN
