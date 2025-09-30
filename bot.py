@@ -595,7 +595,10 @@ class QueueView(discord.ui.View):
         )
         item_embed.add_field(name="🔵 Time Azul", value=mention_list(team_blue), inline=True)
         item_embed.add_field(name="🔴 Time Vermelho", value=mention_list(team_red), inline=True)
-        await partida_ch.send(embed=item_embed, view=item_view)
+        item_message = await partida_ch.send(embed=item_embed, view=item_view)
+        match["item_message_id"] = item_message.id
+        match["item_channel_id"] = item_message.channel.id
+        match["item_view"] = item_view
 
         # painel principal (capitães)
         panel = MatchPanelView(self.ctx, match)
@@ -618,6 +621,12 @@ class ItemUseView(discord.ui.View):
     @discord.ui.button(label="Usar ✖2 (Dobro)", style=discord.ButtonStyle.primary, emoji="✖️")
     async def btn_double(self, interaction: discord.Interaction, button: discord.ui.Button):
         pid = str(interaction.user.id)
+        current_match = active_matches.get(interaction.channel_id)
+        if current_match is not self.match:
+            return await interaction.response.send_message(
+                "⏱️ Esta partida já foi encerrada. Os itens não podem mais ser usados.",
+                ephemeral=True,
+            )
         ensure_player(pid)
         inv = players[pid]["items"]
         if inv.get(ITEM_DOUBLE, 0) <= 0:
@@ -633,6 +642,12 @@ class ItemUseView(discord.ui.View):
     @discord.ui.button(label="Usar 🛡️ (Escudo)", style=discord.ButtonStyle.success, emoji="🛡️")
     async def btn_shield(self, interaction: discord.Interaction, button: discord.ui.Button):
         pid = str(interaction.user.id)
+        current_match = active_matches.get(interaction.channel_id)
+        if current_match is not self.match:
+            return await interaction.response.send_message(
+                "⏱️ Esta partida já foi encerrada. Os itens não podem mais ser usados.",
+                ephemeral=True,
+            )
         ensure_player(pid)
         inv = players[pid]["items"]
         if inv.get(ITEM_SHIELD, 0) <= 0:
@@ -832,6 +847,27 @@ class MatchPanelView(discord.ui.View):
         embed.add_field(name="Itens usados", value="\n".join(used_lines) if used_lines else "—", inline=False)
 
         await (ch_obj(self.ctx.guild, "partida") or self.ctx.channel).send(embed=embed)
+
+        item_message_id = match.get("item_message_id")
+        if item_message_id:
+            item_channel: Optional[Messageable] = None
+            channel_id = match.get("item_channel_id")
+            if channel_id:
+                possible_channel = self.ctx.guild.get_channel(channel_id)
+                if isinstance(possible_channel, Messageable):
+                    item_channel = possible_channel
+            if item_channel is None and isinstance(self.ctx.channel, Messageable):
+                item_channel = self.ctx.channel
+            if item_channel:
+                try:
+                    message = await item_channel.fetch_message(item_message_id)
+                    await message.edit(view=None)
+                except Exception:
+                    pass
+
+        item_view = match.get("item_view")
+        if item_view:
+            item_view.stop()
 
         # log
         log_lines = [
