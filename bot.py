@@ -2,8 +2,12 @@
 import os
 import json
 import random
+import tempfile
 import datetime as dt
-from typing import Dict, List, Optional, Tuple
+import logging
+from contextlib import suppress
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -37,26 +41,63 @@ DAILY_REWARDS = [
 ]
 DAILY_COOLDOWN_HOURS = 20
 
+# Diretório de dados (permite customizar via variável de ambiente)
+DATA_DIR = Path(os.getenv("RANKED_BOT_DATA", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # Arquivos
-PLAYERS_FILE = "players.json"
-MATCHES_FILE = "matches.json"
-CONFIG_FILE  = "config.json"
+PLAYERS_FILE = DATA_DIR / "players.json"
+MATCHES_FILE = DATA_DIR / "matches.json"
+CONFIG_FILE  = DATA_DIR / "config.json"
+
+
+def default_items() -> Dict[str, int]:
+    return {ITEM_DOUBLE: 1, ITEM_SHIELD: 1}
+
+
+PLAYER_DEFAULTS = {
+    "points": 0,
+    "wins": 0,
+    "losses": 0,
+    "mvps": 0,
+    "streak": 0,
+    "max_streak": 0,
+    "medals": list,
+    "items": default_items,
+    "history": list,
+    "coins": 0,
+    "last_daily": lambda: None,
+}
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ranked-bot")
 
 # =========================
 #        STORAGE
 # =========================
-def load_json(path: str, default):
-    if os.path.exists(path):
+def load_json(path: Path, default):
+    """Carrega JSON do disco retornando *default* em caso de falha."""
+
+    if path.exists():
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with path.open("r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return default
     return default
 
-def save_json(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def save_json(path: Path, data):
+    """Salva JSON de forma atômica para evitar corrupção em desligamentos."""
+
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_name, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
 
 players: Dict[str, dict] = load_json(PLAYERS_FILE, {})
 matches: List[dict] = load_json(MATCHES_FILE, [])
@@ -70,21 +111,47 @@ config  = load_json(CONFIG_FILE, {
     }
 })
 
+config_channels = config.setdefault("channels", {})
+missing_channel_keys = False
+for key in ("fila", "partida", "ranking", "notificacoes", "logs"):
+    if key not in config_channels:
+        config_channels[key] = None
+        missing_channel_keys = True
+if missing_channel_keys:
+    save_json(CONFIG_FILE, config)
+
+def make_player() -> Dict[str, object]:
+    """Retorna a estrutura padrão de um jogador."""
+
+    data: Dict[str, object] = {}
+    for key, factory in PLAYER_DEFAULTS.items():
+        data[key] = factory() if callable(factory) else factory
+    return data
+
+
 def ensure_player(pid: str):
+    """Garante que o jogador existe e possui todos os campos necessários."""
+
     if pid not in players:
-        players[pid] = {
-            "points": 0,
-            "wins": 0,
-            "losses": 0,
-            "mvps": 0,
-            "streak": 0,
-            "max_streak": 0,
-            "medals": [],
-            "items": {ITEM_DOUBLE: 1, ITEM_SHIELD: 1},
-            "history": [],
-            "coins": 0,
-            "last_daily": None
-        }
+        players[pid] = make_player()
+
+    pdata = players[pid]
+    for key, factory in PLAYER_DEFAULTS.items():
+        if key not in pdata:
+            pdata[key] = factory() if callable(factory) else factory
+
+    items = pdata.get("items")
+    if not isinstance(items, dict):
+        pdata["items"] = default_items()
+        items = pdata["items"]
+    for item_name in default_items().keys():
+        items.setdefault(item_name, 0)
+
+
+for existing_pid in list(players.keys()):
+    ensure_player(existing_pid)
+if players:
+    save_json(PLAYERS_FILE, players)
 
 # =========================
 #           BOT
@@ -109,10 +176,12 @@ def tier_of(points: int) -> Tuple[str, str]:
     if points < 800:  return "Platina", "💎"
     return "Diamante", "🔷"
 
-def mention_list(ids: List[int]) -> str:
-    return "\n".join(f"• <@{i}>" for i in ids) if ids else "—"
+def mention_list(ids: Iterable[int]) -> str:
+    members = list(ids)
+    return "\n".join(f"• <@{i}>" for i in members) if members else "—"
 
-def pretty_team(guild: discord.Guild, team_ids: List[int]) -> str:
+
+def pretty_team(guild: discord.Guild, team_ids: Iterable[int]) -> str:
     lines = []
     for i in team_ids:
         m = guild.get_member(i)
@@ -124,19 +193,24 @@ def rank_emoji_name(guild: discord.Guild, member: discord.Member, rank_number: i
     # formato: "RANK X NomeDeUsuario"
     return f"RANK {rank_number} {member.name}"
 
-def can_daily(last_iso: Optional[str], hours: int = DAILY_COOLDOWN_HOURS) -> Tuple[bool, int]:
+def can_daily(
+    last_iso: Optional[str],
+    hours: int = DAILY_COOLDOWN_HOURS,
+) -> Tuple[bool, dt.timedelta]:
+    """Retorna se é possível pegar o daily e o tempo restante."""
+
+    cooldown = dt.timedelta(hours=hours)
     if not last_iso:
-        return True, 0
+        return True, dt.timedelta()
     try:
         last = dt.datetime.fromisoformat(last_iso)
     except Exception:
-        return True, 0
+        return True, dt.timedelta()
     now = dt.datetime.utcnow()
     diff = now - last
-    if diff.total_seconds() >= hours * 3600:
-        return True, 0
-    restante = hours - int(diff.total_seconds() // 3600)
-    return False, max(restante, 0)
+    if diff >= cooldown:
+        return True, dt.timedelta()
+    return False, max(cooldown - diff, dt.timedelta())
 
 def ch_id(kind: str) -> Optional[int]:
     return config.get("channels", {}).get(kind)
@@ -158,11 +232,44 @@ def valid_team_size(n: Optional[int]) -> int:
         n = 4
     return 2 if n == 2 else (3 if n == 3 else 4)
 
+
+def sorted_players(key: str = "points", reverse: bool = True) -> List[Tuple[str, dict]]:
+    """Retorna jogadores ordenados por uma chave específica."""
+
+    return sorted(players.items(), key=lambda kv: kv[1].get(key, 0), reverse=reverse)
+
+
+def player_rank(pid: str) -> Optional[int]:
+    """Retorna a posição do jogador no ranking geral (1-indexed)."""
+
+    for idx, (player_id, _) in enumerate(sorted_players(), start=1):
+        if player_id == pid:
+            return idx
+    return None
+
+
+def human_timedelta(delta: dt.timedelta) -> str:
+    """Formata uma timedelta em horas/minutos amigáveis."""
+
+    total_seconds = int(delta.total_seconds())
+    if total_seconds <= 0:
+        return "instantes"
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts: List[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}min")
+    if not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
 # =========================
 #   RANKING / APELIDOS
 # =========================
 async def refresh_leaderboard_and_nicks(ctx: commands.Context):
-    ranking = sorted(players.items(), key=lambda kv: kv[1]["points"], reverse=True)
+    ranking = sorted_players()
 
     # atualiza apelidos conforme ranking
     for i, (pid, pdata) in enumerate(ranking, start=1):
@@ -605,10 +712,17 @@ class MatchPanelView(discord.ui.View):
         embed.add_field(name="Itens usados", value="\n".join(used_lines) if used_lines else "—", inline=False)
 
         await (ch_obj(self.ctx.guild, "partida") or self.ctx.channel).send(embed=embed)
+        log.info(
+            "Partida %s finalizada | vencedor=%s | mvp=%s",
+            mid,
+            "azul" if winner == "blue" else "vermelho",
+            mvp,
+        )
 
         # log
+        mvp_member = self.ctx.guild.get_member(mvp) if mvp else None
         log_lines = [
-            f"Match {mid} | Winner: {'AZUL' if winner=='blue' else 'VERMELHO'} | MVP: {mvp and self.ctx.guild.get_member(mvp).display_name}",
+            f"Match {mid} | Winner: {'AZUL' if winner=='blue' else 'VERMELHO'} | MVP: {mvp_member.display_name if mvp_member else mvp}",
             f"Blue: {', '.join(str(u) for u in blue)}",
             f"Red:  {', '.join(str(u) for u in red)}",
             f"Delta: { {str(k): v for k, v in delta_points.items()} }",
@@ -637,13 +751,35 @@ class MatchPanelView(discord.ui.View):
 # =========================
 @bot.event
 async def on_ready():
-    print(f"🤖 Online como {bot.user} (discord.py {discord.__version__})")
+    log.info("🤖 Online como %s (discord.py %s)", bot.user, discord.__version__)
     # sincroniza slash commands
     try:
         await bot.tree.sync()
-        print("✅ Slash commands sincronizados.")
-    except Exception as e:
-        print(f"⚠️ Erro ao sync slash commands: {e}")
+        log.info("✅ Slash commands sincronizados.")
+    except Exception:
+        log.exception("⚠️ Erro ao sync slash commands")
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    """Lida com erros comuns para dar feedback amigável aos jogadores."""
+
+    original = getattr(error, "original", error)
+    if isinstance(original, commands.CommandNotFound):
+        return  # silencia comandos inexistentes para não poluir o chat
+    if isinstance(original, commands.CommandOnCooldown):
+        retry_after = dt.timedelta(seconds=int(original.retry_after))
+        return await ctx.send(
+            f"⏱️ Este comando está em cooldown. Tente novamente em **{human_timedelta(retry_after)}**."
+        )
+    if isinstance(original, commands.MissingPermissions):
+        return await ctx.send("🔒 Você não possui permissão para usar este comando.")
+    if isinstance(original, commands.BotMissingPermissions):
+        missing = ", ".join(original.missing_permissions)
+        return await ctx.send(f"🤖 Estou sem permissões necessárias: `{missing}`.")
+
+    log.exception("Erro não tratado em comando", exc_info=original)
+    await ctx.send("❌ Ocorreu um erro inesperado. A staff foi notificada.")
 
 # =========================
 #         COMANDOS
@@ -714,8 +850,40 @@ async def cmd_perfil(ctx: commands.Context, member: Optional[discord.Member] = N
     embed.add_field(name="MVPs", value=str(p["mvps"]), inline=True)
     embed.add_field(name="Streak (máx.)", value=f"{p['streak']} (**máx:** {p['max_streak']})", inline=True)
     embed.add_field(name="Moedas", value=str(p.get("coins", 0)), inline=True)
+    ranking_position = player_rank(pid)
+    if ranking_position is not None:
+        embed.add_field(
+            name="Posição no Ranking",
+            value=f"#{ranking_position} de {len(players)}",
+            inline=True,
+        )
     medals = ", ".join(p["medals"]) if p["medals"] else "—"
     embed.add_field(name="Medalhas", value=medals, inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="rank", aliases=["posicao"])
+async def cmd_rank(ctx: commands.Context, member: Optional[discord.Member] = None):
+    """Mostra a posição do jogador no ranking geral."""
+
+    member = member or ctx.author
+    pid = str(member.id)
+    ensure_player(pid)
+    position = player_rank(pid)
+    total_players = len(players)
+    if position is None or total_players == 0:
+        return await ctx.send("📉 Ainda não há dados suficientes para o ranking.")
+
+    pdata = players[pid]
+    tier_name, tier_emoji = tier_of(pdata["points"])
+    embed = discord.Embed(
+        title=f"🏅 Ranking de {member.display_name}",
+        description=f"Você está em **#{position}** de **{total_players}** jogadores ativos.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Pontos", value=str(pdata["points"]), inline=True)
+    embed.add_field(name="Tier", value=f"{tier_emoji} {tier_name}", inline=True)
+    embed.add_field(name="Vitórias", value=str(pdata["wins"]), inline=True)
     await ctx.send(embed=embed)
 
 @bot.command(name="inventario", aliases=["inv"])
@@ -744,19 +912,19 @@ def _format_top_list(pairs, guild, key_label):
 
 @bot.command(name="topvitorias")
 async def cmd_top_vitorias(ctx: commands.Context):
-    ranking = sorted(players.items(), key=lambda kv: kv[1].get("wins", 0), reverse=True)[:10]
+    ranking = sorted_players("wins")[:10]
     desc = _format_top_list(ranking, ctx.guild, "wins")
     await ctx.send(embed=discord.Embed(title="🏆 Top Vitórias", description=desc, color=discord.Color.gold()))
 
 @bot.command(name="topderrotas")
 async def cmd_top_derrotas(ctx: commands.Context):
-    ranking = sorted(players.items(), key=lambda kv: kv[1].get("losses", 0), reverse=True)[:10]
+    ranking = sorted_players("losses")[:10]
     desc = _format_top_list(ranking, ctx.guild, "losses")
     await ctx.send(embed=discord.Embed(title="💀 Top Derrotas", description=desc, color=discord.Color.red()))
 
 @bot.command(name="topstreak")
 async def cmd_top_streak(ctx: commands.Context):
-    ranking = sorted(players.items(), key=lambda kv: kv[1].get("max_streak", 0), reverse=True)[:10]
+    ranking = sorted_players("max_streak")[:10]
     lines = []
     for i, (pid, pdata) in enumerate(ranking, start=1):
         m = ctx.guild.get_member(int(pid))
@@ -913,9 +1081,11 @@ async def cmd_vender(ctx, item: str, qtd: int = 1):
 async def cmd_daily(ctx):
     pid = str(ctx.author.id)
     ensure_player(pid)
-    ok, hrs = can_daily(players[pid].get("last_daily"))
+    ok, remaining = can_daily(players[pid].get("last_daily"))
     if not ok:
-        return await ctx.send(f"⏳ Você já pegou seu daily. Tente novamente em ~**{hrs}h**.")
+        return await ctx.send(
+            f"⏳ Você já pegou seu daily. Tente novamente em ~**{human_timedelta(remaining)}**."
+        )
 
     reward = random.choice(DAILY_REWARDS)
     if reward[0] == "coins":
