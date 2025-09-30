@@ -551,7 +551,35 @@ class QueueView(discord.ui.View):
         # cria canais de voz e texto
         team1_vc = await guild.create_voice_channel("TEAM 1", category=parent, reason="Partida - Team 1")
         team2_vc = await guild.create_voice_channel("TEAM 2", category=parent, reason="Partida - Team 2")
-        vote_tc  = await guild.create_text_channel("votacao-partida", category=parent, reason="Votação dos Capitães")
+
+        # configura permissões do canal de votação para capitães (e staff, se configurado)
+        overwrites: Dict[Union[discord.Role, discord.Member], discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False)
+        }
+
+        allow_perms = dict(view_channel=True, send_messages=True, read_message_history=True)
+
+        bot_member = guild.me
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(**allow_perms)
+
+        staff_role_id = config.get("roles", {}).get("staff") if isinstance(config, dict) else None
+        if staff_role_id:
+            staff_role = guild.get_role(staff_role_id)
+            if staff_role:
+                overwrites[staff_role] = discord.PermissionOverwrite(**allow_perms)
+
+        for cap_id in (cap_blue, cap_red):
+            member = guild.get_member(cap_id)
+            if member:
+                overwrites[member] = discord.PermissionOverwrite(**allow_perms)
+
+        vote_tc  = await guild.create_text_channel(
+            "votacao-partida",
+            category=parent,
+            reason="Votação dos Capitães",
+            overwrites=overwrites,
+        )
 
         match["team1_vc_id"] = team1_vc.id
         match["team2_vc_id"] = team2_vc.id
