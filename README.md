@@ -52,7 +52,10 @@ O bot carregará os arquivos JSON existentes (ou criará novos) e ficará online
 | `!historico [@user]` | Histórico recente de partidas do jogador. |
 | `!setcanal <tipo>` | Configura canais de fila, ranking, notificações e logs. |
 | `!loja`, `!comprar`, `!vender` | Interagem com a economia do bot. |
+| `!presentear @user <coins>` | Transfere coins para outro jogador. |
 | `!daily` | Resgata recompensa diária se o cooldown já expirou. |
+
+> Todos os comandos acima possuem versões _slash_ (`/fila`, `/perfil`, `/inventario`, `/top`, `/topvitorias`, `/topderrotas`, `/topstreak`, `/historico`, `/saldo`, `/loja`, `/comprar`, `/vender`, `/presentear`, `/daily`).
 
 ## 📝 Desenvolvimento
 - O código utiliza `discord.ext.commands` e comandos _slash_ via `discord.app_commands`.
