@@ -42,6 +42,22 @@ python bot.py
 ```
 O bot carregará os arquivos JSON existentes (ou criará novos) e ficará online aguardando comandos. Use `!ajuda` dentro do Discord para ver a lista completa de comandos prefixados e _slash_.
 
+### 🔁 Monitoramento contínuo de mercado
+O utilitário `ranking_bot/market_analyzer.py` acompanha um arquivo JSON com histórico de preços de jogadores e sugere quais atletas comprar ou vender. Para testar o fluxo rapidamente, copie o arquivo de exemplo:
+
+```bash
+cp market_data.sample.json market_data.json
+python ranking_bot/market_analyzer.py --once
+```
+
+Para manter o monitoramento rodando de forma contínua:
+
+```bash
+python ranking_bot/market_analyzer.py --interval 120 --top 5
+```
+
+> Ajuste `market_data.json` com seus próprios dados (preços, demanda e oferta) para obter recomendações personalizadas.
+
 ## 📚 Comandos principais
 | Comando | Descrição |
 |---------|-----------|
